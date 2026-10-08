@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dmarcator - lock down parked domains</title>
+<style>
+  :root { --fg:#1c1f23; --muted:#5f6b76; --bg:#f6f7f9; --card:#fff; --line:#d8dde3; --accent:#0b6bcb; --warn:#8a5a00; --warnbg:#fff6e0; --err:#b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e8eaed; --muted:#9aa5b1; --bg:#14171a; --card:#1d2125; --line:#33393f; --accent:#5aa7f5; --warn:#f2c46d; --warnbg:#2b2312; --err:#f2877f; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.5 system-ui, sans-serif; color:var(--fg); background:var(--bg); }
+  main { max-width: 900px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { margin: 0 0 4px; font-size: 1.6rem; }
+  .sub { color: var(--muted); margin: 0 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:16px; }
+  .warn { background:var(--warnbg); color:var(--warn); border-color:var(--warn); }
+  label { display:block; font-weight:600; margin-bottom:4px; }
+  textarea, input[type=text], select { width:100%; font:inherit; color:inherit; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:8px; }
+  textarea { font-family: ui-monospace, Menlo, Consolas, monospace; font-size:14px; }
+  .row { display:flex; gap:16px; flex-wrap:wrap; }
+  .row > div { flex:1 1 240px; }
+  .checks label { font-weight:400; display:flex; gap:8px; align-items:center; margin:4px 0; }
+  button { font:inherit; cursor:pointer; border:1px solid var(--line); background:var(--card); color:var(--fg); border-radius:6px; padding:6px 12px; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .bar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:8px; }
+  .bar .spacer { flex:1; }
+  #errors { color:var(--err); margin:8px 0 0; padding-left:20px; }
+  #errors:empty { display:none; }
+  #drop.over { outline:2px dashed var(--accent); }
+  small, .muted { color:var(--muted); }
+  footer { color:var(--muted); font-size:.9rem; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>dmarcator</h1>
+  <p class="sub">Generate DNS records that lock down a parked (non-sending) domain: null MX, SPF <code>-all</code>, and DMARC <code>p=reject</code>.</p>
+
+  <div class="card warn">
+    <strong>Only use this on domains that send no email.</strong> Publishing these records on a domain that sends mail will make that mail fail.
+    Everything runs in your browser. Nothing you type is sent anywhere.
+  </div>
+
+  <div class="card" id="drop">
+    <label for="domains">Domains <small>(one per line, or commas/spaces; # starts a comment)</small></label>
+    <textarea id="domains" rows="6" placeholder="mycompany.net&#10;mycompany.org&#10;# parked brand names&#10;mybrand.io"></textarea>
+    <div class="bar" style="margin-top:8px">
+      <button type="button" id="upload">Load .txt file…</button>
+      <input type="file" id="file" accept=".txt,text/plain" hidden>
+      <small>or drag a .txt file onto this box</small>
+    </div>
+    <ul id="errors"></ul>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label for="rua">Report mailbox (RUA) <small>optional</small></label>
+        <input type="text" id="rua" placeholder="dmarc-reports@yourmaindomain.com" autocomplete="off">
+        <small>If it's on a different domain, an authorization record for that domain is added.</small>
+      </div>
+      <div>
+        <label for="format">Output format</label>
+        <select id="format">
+          <option value="zone">Zone file (BIND)</option>
+          <option value="table">Table (copy into a DNS UI)</option>
+          <option value="csv">CSV</option>
+        </select>
+      </div>
+    </div>
+    <div class="checks" style="margin-top:8px">
+      <label><input type="checkbox" id="wildcard" checked> Wildcard SPF record for subdomains</label>
+      <label><input type="checkbox" id="zoneHeader"> Include placeholder SOA/NS records <small>(zone file only)</small></label>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="bar">
+      <strong id="count">Output</strong>
+      <span class="spacer"></span>
+      <button type="button" class="primary" id="copy">Copy</button>
+      <button type="button" id="download">Download</button>
+    </div>
+    <textarea id="out" rows="18" readonly spellcheck="false"></textarea>
+  </div>
+
+  <footer>
+    dmarcator is a free tool offered by joseph mcmahon, 2026. <a href="https://joemac.io">joemac.io</a>.
+    A command-line version, <code>dmarcator.py</code>, does the same thing.
+  </footer>
+</main>
+
+<script>
+"use strict";
+const LABEL_RE = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/;
+const EMAIL_RE = /^[^@\s]+@([^@\s]+)$/;
+
+function normalizeDomain(raw) {
+  let d = raw.trim().toLowerCase();
+  d = d.replace(/^[a-z]+:\/\//, "");
+  d = d.split("/")[0].replace(/\.+$/, "");
+  if (!d) throw new Error("empty domain");
+  try {                                   // punycode for internationalized names
+    d = new URL("http://" + d).hostname;
+  } catch (e) {
+    throw new Error(`'${raw}' is not a valid domain name`);
+  }
+  d = d.replace(/\.+$/, "");
+  const labels = d.split(".");
+  if (labels.length < 2 || d.length > 253 || !labels.every(l => LABEL_RE.test(l)))
+    throw new Error(`'${raw}' is not a valid domain name`);
+  return d;
+}
+
+function validateRua(rua) {
+  rua = rua.trim().replace(/^mailto:/i, "");
+  const m = EMAIL_RE.exec(rua);
+  if (!m) throw new Error(`'${rua}' is not a valid email address`);
+  return [rua, normalizeDomain(m[1])];
+}
+
+const isSameOrg = (domain, rd) => rd === domain || rd.endsWith("." + domain);
+
+function buildRecords(domain, rua, wildcard) {
+  const records = [["@", "MX", "0 ."], ["@", "TXT", '"v=spf1 -all"']];
+  if (wildcard) records.push(["*", "TXT", '"v=spf1 -all"']);
+  let dmarc = "v=DMARC1; p=reject; sp=reject", auth = null;
+  if (rua) {
+    const [address, reportDomain] = validateRua(rua);
+    dmarc += `; rua=mailto:${address}`;
+    if (!isSameOrg(domain, reportDomain))
+      auth = { name: `${domain}._report._dmarc`, type: "TXT", value: '"v=DMARC1"', zone: reportDomain };
+  }
+  records.push(["_dmarc", "TXT", `"${dmarc}"`]);
+  return { records, auth };
+}
+
+const COMMENTS = {
+  "@|MX": "; Null MX: domain accepts no mail (RFC 7505)",
+  "@|TXT": "; SPF: no server may send for this domain",
+  "*|TXT": "; SPF for subdomains (SPF is not inherited)",
+  "_dmarc|TXT": "; DMARC: reject failures, including subdomains",
+};
+
+function pad(s, n) { return String(s).padEnd(n, " "); }
+
+function renderZone(domain, { records, auth }, zoneHeader, serial) {
+  const out = [`; ===== Parked domain: ${domain} =====`, `$ORIGIN ${domain}.`, "$TTL 3600", ""];
+  if (zoneHeader) out.push(
+    "; --- Zone authority (PLACEHOLDERS: replace with your provider's values) ---",
+    `@       IN  SOA   ns1.example-dns.com. hostmaster.${domain}. (`,
+    `                  ${pad(serial, 11)} ; serial (YYYYMMDDNN)`,
+    "                  7200        ; refresh",
+    "                  3600        ; retry",
+    "                  1209600     ; expire",
+    "                  3600 )      ; negative-caching TTL",
+    "",
+    "@       IN  NS    ns1.example-dns.com.",
+    "@       IN  NS    ns2.example-dns.com.",
+    "");
+  for (const [name, type, value] of records) {
+    out.push(COMMENTS[name + "|" + type], `${pad(name, 7)} IN  ${pad(type, 4)} ${value}`, "");
+  }
+  if (auth) out.push(
+    `; ----- Add this to the zone for ${auth.zone} (the REPORT-RECEIVING domain) -----`,
+    `; Authorizes ${auth.zone} to receive DMARC reports about ${domain}.`,
+    `; (Or publish one wildcard instead:  *._report._dmarc  IN  TXT  ${auth.value})`,
+    `${auth.name}.${auth.zone}.  IN  ${auth.type}  ${auth.value}`,
+    "");
+  return out.join("\n");
+}
+
+// Flat rows for table/CSV. Values are unquoted, which is what most DNS UIs expect.
+function flatRows(domain, { records, auth }) {
+  const unq = v => v.replace(/^"|"$/g, "");
+  const rows = records.map(([name, type, value]) => ({ zone: domain, name, type, value: unq(value), ttl: 3600 }));
+  if (auth) rows.push({ zone: auth.zone, name: auth.name, type: auth.type, value: unq(auth.value), ttl: 3600 });
+  return rows;
+}
+
+function renderTable(rows) {
+  const cols = ["zone", "name", "type", "value", "ttl"];
+  const w = cols.map(c => Math.max(c.length, ...rows.map(r => String(r[c]).length)));
+  const line = r => cols.map((c, i) => pad(r[c], w[i])).join("  ").trimEnd();
+  const head = Object.fromEntries(cols.map(c => [c, c.toUpperCase()]));
+  return [line(head), w.map(n => "-".repeat(n)).join("  "), ...rows.map(line)].join("\n");
+}
+
+function renderCsv(rows) {
+  const q = v => /[",\n]/.test(v) ? `"${String(v).replace(/"/g, '""')}"` : String(v);
+  const cols = ["zone", "name", "type", "value", "ttl"];
+  return [cols.join(","), ...rows.map(r => cols.map(c => q(r[c])).join(","))].join("\n");
+}
+
+function parseDomains(text) {
+  const seen = new Set(), out = [];
+  for (const line of text.split(/\r?\n/)) {
+    for (const d of line.split("#")[0].trim().split(/[,\s]+/)) {
+      if (d && !seen.has(d.toLowerCase())) { seen.add(d.toLowerCase()); out.push(d); }
+    }
+  }
+  return out;
+}
+
+function generate(text, opts) {
+  const serial = new Date().toISOString().slice(0, 10).replace(/-/g, "") + "01";
+  const chunks = [], rows = [], errors = [], seen = new Set();
+  for (const raw of parseDomains(text)) {
+    try {
+      const domain = normalizeDomain(raw);
+      if (seen.has(domain)) continue;
+      seen.add(domain);
+      const built = buildRecords(domain, opts.rua, opts.wildcard);
+      if (opts.format === "zone") chunks.push(renderZone(domain, built, opts.zoneHeader, serial));
+      else rows.push(...flatRows(domain, built));
+    } catch (e) { errors.push(e.message); }
+  }
+  let output = "";
+  if (opts.format === "zone") output = chunks.join("\n");
+  else if (rows.length) output = opts.format === "csv" ? renderCsv(rows) : renderTable(rows);
+  return { output, errors, count: seen.size };
+}
+
+// ---- UI ----
+if (typeof document !== "undefined") {
+  const $ = id => document.getElementById(id);
+  const EXT = { zone: "zone", table: "txt", csv: "csv" };
+
+  function update() {
+    let ruaError = null, rua = $("rua").value.trim();
+    if (rua) { try { validateRua(rua); } catch (e) { ruaError = e.message; rua = ""; } }
+    const r = generate($("domains").value, {
+      rua, wildcard: $("wildcard").checked, zoneHeader: $("zoneHeader").checked, format: $("format").value,
+    });
+    const errs = ruaError ? [`RUA ignored: ${ruaError}`, ...r.errors] : r.errors;
+    $("errors").replaceChildren(...errs.map(m => Object.assign(document.createElement("li"), { textContent: m })));
+    $("out").value = r.output;
+    $("count").textContent = r.count ? `Output: ${r.count} domain${r.count === 1 ? "" : "s"}` : "Output";
+    $("zoneHeader").disabled = $("format").value !== "zone";
+  }
+
+  async function loadFile(file) {
+    if (!file) return;
+    const text = await file.text();
+    const cur = $("domains").value;
+    $("domains").value = cur.trim() ? cur.replace(/\s*$/, "\n") + text : text;
+    update();
+  }
+
+  for (const id of ["domains", "rua", "format", "wildcard", "zoneHeader"]) $(id).addEventListener("input", update);
+  $("upload").addEventListener("click", () => $("file").click());
+  $("file").addEventListener("change", async e => { await loadFile(e.target.files[0]); e.target.value = ""; });
+
+  const drop = $("drop");
+  drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+  drop.addEventListener("drop", async e => {
+    e.preventDefault(); drop.classList.remove("over");
+    await loadFile(e.dataTransfer.files[0]);
+  });
+
+  $("copy").addEventListener("click", async () => {
+    const out = $("out").value; if (!out) return;
+    try { await navigator.clipboard.writeText(out); }
+    catch { $("out").select(); document.execCommand("copy"); }
+    const b = $("copy"); b.textContent = "Copied!"; setTimeout(() => (b.textContent = "Copy"), 1200);
+  });
+
+  $("download").addEventListener("click", () => {
+    const out = $("out").value; if (!out) return;
+    const a = Object.assign(document.createElement("a"), {
+      href: URL.createObjectURL(new Blob([out + "\n"], { type: "text/plain" })),
+      download: `dmarcator.${EXT[$("format").value]}`,
+    });
+    a.click(); URL.revokeObjectURL(a.href);
+  });
+
+  update();
+}
+
+if (typeof module !== "undefined") module.exports = { normalizeDomain, generate };
+</script>
+</body>
+</html>
